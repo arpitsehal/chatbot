@@ -28,7 +28,7 @@ LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
 # --- Endpoints ---
 
-@app.get("/v1/healthz")
+@app.api_route("/v1/healthz", methods=["GET", "HEAD"])
 async def healthz():
     counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
     for (scope, _), _ in contexts.items():
