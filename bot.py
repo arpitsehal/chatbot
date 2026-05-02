@@ -43,11 +43,11 @@ async def healthz():
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": "Antigravity", 
-        "team_members": ["Antigravity"], 
+        "team_name": "arpit kumar", 
+        "team_members": ["arpit kumar"], 
         "model": LLM_MODEL,
         "approach": "Structured OpenRouter LLM composer with explicit prompt engineering for 5-dimension scoring.", 
-        "contact_email": "bot@example.com",
+        "contact_email": "2005sehalarpit@gmail.com",
         "version": "1.0.0", 
         "submitted_at": datetime.utcnow().isoformat() + "Z"
     }
