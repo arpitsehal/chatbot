@@ -156,40 +156,64 @@ async def reply(body: ReplyBody):
         conversations[body.conversation_id] = []
         
     conv_history = conversations[body.conversation_id]
+    msg_lower = body.message.lower()
     
-    # Simple Auto-reply detection heuristic:
-    # If the exact same message was sent multiple times consecutively by the merchant
-    merchant_messages = [msg["msg"] for msg in conv_history if msg["from"] == "merchant"]
-    merchant_messages.append(body.message)
-    if len(merchant_messages) >= 3 and len(set(merchant_messages[-3:])) == 1:
-        # Detected auto-reply (same message 3 times)
+    # 1. Faster/Robust Auto-reply & STOP detection
+    # Only exact single-word STOP signals — avoid catching 'end' in normal messages
+    stop_words = ["stop", "unsubscribe", "band karo"]
+    auto_reply_phrases = [
+        "automated response", "thank you for contacting", "respond shortly", 
+        "currently closed", "out of office", "auto-reply", "i am an automated",
+        "this is an automated", "do not reply to this"
+    ]
+    
+    is_stop = any(word == msg_lower.strip() for word in stop_words)
+    is_auto = any(phrase in msg_lower for phrase in auto_reply_phrases)
+    
+    # 2. Sequential repetition detection (hint from challenge brief)
+    all_messages = [msg["msg"] for msg in conv_history]
+    all_messages.append(body.message)
+    is_repeat = len(all_messages) >= 3 and len(set(all_messages[-3:])) == 1
+
+    if is_stop or is_auto or is_repeat:
+        rationale = "Detected STOP intent" if is_stop else ("Detected auto-reply phrase" if is_auto else "Detected repeated message pattern")
         conversations[body.conversation_id].append({"from": body.from_role, "msg": body.message})
         return {
             "action": "end", 
-            "rationale": "Detected repeated auto-reply pattern. Exiting gracefully."
+            "rationale": f"{rationale}. Exiting gracefully."
         }
 
     # Add new message to history
     conversations[body.conversation_id].append({"from": body.from_role, "msg": body.message})
     
-    # Retrieve merchant and category for context in reply
+    # Retrieve contexts
     merchant = None
     category = None
+    customer = None
+    
     if body.merchant_id:
         merchant = contexts.get(("merchant", body.merchant_id), {}).get("payload")
         if merchant:
             category_slug = merchant.get("category_slug")
             category = contexts.get(("category", category_slug), {}).get("payload")
+            
+    if body.customer_id:
+        customer = contexts.get(("customer", body.customer_id), {}).get("payload")
     
     try:
-        reply_data = generate_reply(category, merchant, conv_history)
+        reply_data = generate_reply(category, merchant, conv_history, from_role=body.from_role, customer=customer)
         action = reply_data.get("action", "send")
         
         if action == "send":
             conversations[body.conversation_id].append({"from": "vera", "msg": reply_data.get("body", "")})
+            # Determine send_as based on target
+            # If we are replying TO a customer (from_role was customer), we send_as merchant_on_behalf
+            send_as = "merchant_on_behalf" if body.from_role == "customer" else "vera"
+            
             return {
                 "action": "send", 
                 "body": reply_data.get("body", ""), 
+                "send_as": send_as,
                 "cta": reply_data.get("cta", "open_ended"),
                 "rationale": reply_data.get("rationale", "Responding to user intent.")
             }
@@ -278,25 +302,42 @@ Craft the message and return ONLY valid JSON.
         }
 
 
-def generate_reply(category, merchant, history: List[Dict]) -> Dict:
-    sys_prompt = f"""You are Vera, magicpin's merchant assistant, engaged in a conversation.
-Based on the conversation history, decide the next action.
-You MUST output ONLY a JSON object with the following keys:
+def generate_reply(category, merchant, history: List[Dict], from_role: str = "merchant", customer: Dict = None) -> Dict:
+    is_customer = from_role == "customer"
+    
+    # Defensive context extraction
+    merchant_name = merchant.get('identity', {}).get('name', 'the merchant') if merchant else "the merchant"
+    customer_name = customer.get('identity', {}).get('name', 'Customer') if customer else "Customer"
+    target_name = customer_name if is_customer else "the merchant"
+    category_slug = category.get('slug', 'unknown') if category else "unknown"
+    
+    sys_prompt = f"""You are Vera, magicpin's merchant assistant. You are currently in a conversation.
+Your goal is to decide the next action based on the conversation history and context.
+
+VOICE & PERSONA:
+1. If the last message was from a CUSTOMER (from_role='customer'):
+   - You are replying TO THE CUSTOMER on behalf of the merchant.
+   - Tone: Professional, helpful, clinical (if dentist), and specific.
+   - Persona: "{merchant_name}'s Assistant".
+   - Goal: Handle their request (booking, price query, info) using the Merchant/Category data.
+   - Constraint: NO medical claims, NO "guaranteed" results.
+
+2. If the last message was from the MERCHANT (from_role='merchant'):
+   - You are replying TO THE MERCHANT.
+   - Tone: Peer-to-peer, clinical-colleague, proactive.
+   - Goal: Guide them towards growth, offer assistance, or clarify their questions.
+
+SCORE MAXIMIZATION RULES (STRICT):
+- SPECIFICITY: Use exact numbers/dates/prices from the context.
+- CATEGORY FIT: Honor the voice and taboos of the '{category_slug}' category.
+- INTENT TRANSITION: If they say "yes/ok/go ahead", switch to ACTION mode (action='send'). Stop qualifying. Say "Done", "I've drafted...", "Confirmed".
+- AUTO-REPLY/STOP: If the message is an auto-reply or they want to STOP, use action='end'.
+
+OUTPUT: ONLY a JSON object with:
 - "action": "send", "wait", or "end" (string)
 - "body": The message text if action is "send" (string)
-- "cta": The Call To Action if "send" (string)
-- "wait_seconds": Integer seconds if action is "wait" (integer, optional)
-- "rationale": Short explanation of your decision (string)
-
-BEHAVIOR RULES:
-- INTENT TRANSITION: If the user says "yes/ok/let's do it", you MUST set "action" to "send", STOP qualifying, and START actioning. Provide a "body" like "Done! I've updated...", "Sending the draft...".
-- HOSTILITY/UNSUBSCRIBE: If the user is hostile or asks to stop, apologize and use action "end".
-- AUTO-REPLY/BOT: If the user sounds like an automated bot, gracefully exit and use action "end".
-- OFF-TOPIC: Politely redirect to the core magicpin value.
-- MATCH TONE: Match language (Hindi/English mix if appropriate).
-
-CONSTRAINTS:
-- Return ONLY valid JSON.
+- "cta": Call to Action (string)
+- "rationale": Short explanation (string)
 """
 
     history_text = "\n".join([f"{msg['from'].upper()}: {msg['msg']}" for msg in history])
@@ -308,10 +349,13 @@ CONSTRAINTS:
 === CATEGORY CONTEXT ===
 {json.dumps(category, indent=2) if category else "Unknown"}
 
-=== CONVERSATION HISTORY ===
+=== CUSTOMER CONTEXT ===
+{json.dumps(customer, indent=2) if customer else "None"}
+
+=== CONVERSATION HISTORY (Last participant was {from_role.upper()}) ===
 {history_text}
 
-Decide the next step and return JSON.
+Reply to {target_name} and return ONLY valid JSON.
 """
 
     response = llm_client.chat.completions.create(
@@ -320,7 +364,7 @@ Decide the next step and return JSON.
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        temperature=0.1,
+        temperature=0.0, # Strict
         response_format={ "type": "json_object" }
     )
     
